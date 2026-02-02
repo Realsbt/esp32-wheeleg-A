@@ -1,0 +1,1183 @@
+/* ---------------------------------
+Copyright (c) 2024 Mu Shibo
+Modify by Tommy 2025.10.30
+------------------------------------- */
+#include <Arduino.h>
+#include <FastLED.h>
+#include <MPU6050_tockn.h>
+#include <SMS_STS.h>
+#include <SimpleFOC.h>
+#include <FS.h>
+#include <esp_adc_cal.h>
+#include <XboxSeriesXControllerESP32_asukiaaa.hpp>  // xbox手柄
+
+/************ xbox手柄实体 *************/
+XboxSeriesXControllerESP32_asukiaaa::Core xboxController("0a:27:12:5c:71:79");
+
+/************函数申明*************/
+
+// 电压检测函数
+void adc_calibration_init();
+void bat_check();
+
+// 平衡算法函数
+void lqr_balance_loop();
+void yaw_loop();
+void leg_loop();
+void jump_loop();
+void resetZeroPoint();
+void jump_charge(); // 腿部弯曲（蓄能）
+
+// RGB相关函数
+void handleLEDBlink();
+
+// 新增：警灯相关函数
+void startPoliceLights(int speed, int repeats);
+void updatePoliceLights();
+
+// 振动控制函数声明
+void startVibration(uint8_t leftPower, uint8_t rightPower, uint8_t duration);
+void stopVibration();
+void pulseVibration(uint8_t power, uint8_t pulses, uint8_t pulseDuration);
+void updateVibration();
+
+// Xbox手柄相关函数声明
+void process_xbox_notif();
+void process_xbox_string();
+void processControllerData(const XboxControllerNotificationParser& data);
+
+const int deadZone = 10; // 摇杆死区阈值
+bool last_btnbtnRS = 0;
+
+// 新增：警灯手动开关控制变量
+bool policeLightsEnabled = false;  // 警灯总开关状态
+bool last_btnX = false;            // 记录上次X键状态，用于检测按键边沿
+bool last_btnY = false;            // 记录上次Y键状态，用于检测按键边沿
+bool last_btnA = false;            // 记录上次A键状态，用于检测按键边沿
+
+// 振动控制变量
+bool vibrationActive = false;      // 振动是否激活
+unsigned long vibrationStartTime = 0;  // 振动开始时间
+uint8_t vibrationDuration = 0;     // 振动持续时间（单位：0.01秒）
+uint8_t pulseCount = 0;            // 脉冲振动剩余次数
+uint8_t pulseDuration = 0;         // 脉冲持续时间
+unsigned long lastPulseTime = 0;   // 上次脉冲时间
+bool pulseState = false;           // 脉冲状态（开/关）
+
+/************实例定义*************/
+
+// 电机实例
+BLDCMotor motor1 = BLDCMotor(7);
+BLDCMotor motor2 = BLDCMotor(7);
+BLDCDriver3PWM driver1 = BLDCDriver3PWM(32, 33, 25, 22);
+BLDCDriver3PWM driver2 = BLDCDriver3PWM(26, 27, 14, 12);
+
+// 编码器实例
+TwoWire I2Cone = TwoWire(0);
+TwoWire I2Ctwo = TwoWire(1);
+MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
+MagneticSensorI2C sensor2 = MagneticSensorI2C(AS5600_I2C);
+
+// PID控制器实例
+PIDController pid_angle(1, 0, 0, 100000, 8); // 比例系数（P）, 积分系数（I）, 微分系数（D）, 积分限幅(当I=0,无效), 输出限幅（8V防止电机过载）
+PIDController pid_gyro(0.06, 0, 0, 100000, 8); 
+PIDController pid_distance(0.5, 0, 0, 100000, 8);
+PIDController pid_speed(0.7, 0, 0, 100000, 8);
+PIDController pid_yaw_angle(1.0, 0, 0, 100000, 8);
+PIDController pid_yaw_gyro(0.04, 0, 0, 100000, 8);
+PIDController pid_lqr_u(1, 15, 0, 100000, 8);
+PIDController pid_zeropoint(0.002, 0, 0, 100000, 4);
+PIDController pid_roll_angle(8, 0, 0, 100000, 450);
+
+// 低通滤波器实例
+LowPassFilter lpf_joyy(0.2);  // 新输入值占输出值的10%，历史值占90%
+LowPassFilter lpf_zeropoint(0.1);
+LowPassFilter lpf_roll(0.3);
+LowPassFilter lpf_height(0.1);  
+
+// STS舵机实例
+SMS_STS sms_sts;
+
+// MPU6050实例
+MPU6050 mpu6050(I2Ctwo);
+
+// FastLED配置
+#define LED_PIN 21
+#define NUM_LEDS 2
+CRGB leds[NUM_LEDS];
+unsigned long previousBlinkMillis = 0;
+int blinkState = 0;
+int blinkCount = 0;
+bool isBlinking = false;
+CRGB blinkColors[6] = {CRGB::Red, CRGB::Red, CRGB::Yellow, CRGB::Yellow, CRGB::Green, CRGB::Green};
+
+// 新增：警灯状态控制变量（非阻塞实现关键）
+unsigned long lastLedUpdate = 0;  // 上次更新时间戳
+int currentLedState = 0;          // 当前显示状态（0:红-蓝，1:蓝-红）
+int remainingRepeats = 0;         // 剩余切换次数
+int currentSpeed = 0;             // 当前闪烁速度（ms）
+bool isPoliceLightsActive = false;// 警灯是否激活
+int policeMode = 0;               // 当前运行模式（0:慢速，1:快速，2:超快速）
+unsigned long lastModeChange = 0; // 上次模式切换时间戳
+
+/************参数定义*************/
+#define pi 3.1415927
+
+// 机身平衡角度调整 roll轴
+float roll_adjust = 0.0f;  
+
+// 机身高度
+float leg_height_base = 20.0f;  // 改为全局变量，初始值20 腿部默认高度基准值，值越小，机身越高， 实测范围 -10（最高），52（最低）
+
+// #define LEG_HEIGHT_BASE 20  //20 腿部默认高度基准值，值越小，机身越高， 实测范围 -10（最高），52（最低）
+#define SERVO0_MIN  2047 // 舵机1最低位置，大腿与小腿碰到一起， 从小车正面看右手边舵机
+#define SERVO1_MIN  2047 // 舵机2最低位置，大腿与小腿碰到一起， 从小车正面看左手边舵机
+#define SERVO0_MAX (2047 + 12 + 8.4 * (35 + 10)) // 2438 舵机1最高 
+#define SERVO1_MAX (2047 - 12 - 8.4 * (35 + 10)) // 1658 舵机2最高
+
+float leg_position_add = 0;    // roll轴平衡控制量
+int left_height;
+int right_height;
+float LegHeightDiff = 0; // 左右腿高度差
+
+// 舵机运动参数
+byte ID[2] = {1, 2};  
+s16 Position[2];
+u16 Speed[2];
+byte ACC[2];
+
+// 腿部高度逻辑
+// #define LEG_HEIGHT_BASE 20 # 固定值
+// float LegHeightDiff ;  # 根据前后转向运动时，智能计算两腿高度差
+// left_height，right_height  = wrobot.height + LegHeightDiff  # 根据前后左右智能计算两腿高度差
+// leg_position_add = pid_roll_angle(lpf_roll(roll_angle)); 根据roll自动计算
+// Position[0] 2047 + 12 + 8.4 * (left_height - LEG_HEIGHT_BASE) - leg_position_add;
+// Position[1] 2047 - 12 - 8.4 * (right_height - LEG_HEIGHT_BASE) - leg_position_add;
+// Position 2047 - 12 - 8.4 * (right_height                              - LEG_HEIGHT_BASE) - leg_position_add;
+// Position 2047 - 12 - 8.4 * (wrobot.height + LegHeightDiff  - LEG_HEIGHT_BASE) -  pid_roll_angle(lpf_roll(roll_angle));
+//                              遥控器          两腿高度差             固定值               roll轴平衡控制量
+
+// LQR自平衡控制器参数
+float LQR_angle = 0;
+float LQR_gyro = 0;
+float LQR_gyroZ = 0;
+float LQR_speed = 0;
+float LQR_distance = 0;
+float angle_control = 0;
+float gyro_control = 0;
+float speed_control = 0;
+float distance_control = 0;
+float LQR_u = 0;
+float angle_zeropoint = 8;  // 5 设定默认俯仰角度，向前到正，向后倒负
+float original_angle_zeropoint = 8; // 保存原始的角度零点
+float distance_zeropoint =  0.5f; // 轮部位移零点偏置
+
+// YAW轴控制数据
+float YAW_gyro = 0;
+float YAW_angle = 0;
+float YAW_angle_last = 0;
+float YAW_angle_total = 0;
+float YAW_angle_zero_point = -10;
+float YAW_output = 0;
+
+// 记录轮部转速，用于判断跳跃状态
+unsigned long last_speed_record_time = 0;  // 上次记录转速的时间
+const unsigned long SPEED_RECORD_INTERVAL = 100;  // 转速记录间隔(毫秒) ，因为时间相隔太近速度差不明显的
+float last_lqr_speed = 0;    // 记录上一时刻的轮部转速
+float robot_speed_diff = 0;    // 速度差
+
+int jump_flag = 0; // 跳跃过程计数
+int jump_pre_flag = 0; // 跳跃前蓄能计数
+int wheel_ground_flag = 1; // 轮子是否离地标记 默认着地
+
+
+// 电压检测
+#define LED_BAT 13
+uint16_t bat_check_num = 0;
+int BAT_PIN = 35; // select the input pin for the ADC
+static esp_adc_cal_characteristics_t adc_chars;
+static const adc1_channel_t channel = ADC1_CHANNEL_7;
+static const adc_bits_width_t width = ADC_WIDTH_BIT_12;
+static const adc_atten_t atten = ADC_ATTEN_DB_12;
+static const adc_unit_t unit = ADC_UNIT_1;
+
+// 倒地起来辅助计数
+int loopCounter = 0; // loop函数执行计数
+int resetToDefaultCounter = 0; // resetToDefault执行计数
+
+// 小车状态控制
+bool robot_enabled = true; // 小车使能状态，true为起立状态，false为坐下状态
+bool last_robot_enabled = true; // 记录上一次的小车状态
+int sitting_down = 0; // 标记是否正在执行坐下动作
+
+
+typedef struct
+{
+  int mode = 0; // 0:左摇杆左右转向控制（智能），1:左摇杆上下摇摆控制（手动）
+  int height = 30;
+  int roll;
+  int jump = 0; // 0 =不跳跃 1= 跳跃
+  int joyy;
+  int joyy_last;
+  int joyx;
+  int joyx_last;
+} Wrobot;
+Wrobot wrobot;
+
+
+void setup()
+{
+  Serial.begin(115200);   // 通讯串口
+  Serial2.begin(1000000); // 腿部sts舵机
+
+  // 舵机初始化
+  sms_sts.pSerial = &Serial2;
+
+  ID[0] = 1;
+  ID[1] = 2;
+  ACC[0] = 30;
+  ACC[1] = 30;
+  Speed[0] = 400;
+  Speed[1] = 400;
+  Position[0] = SERVO0_MIN;
+  Position[1] = SERVO1_MIN;
+  // 舵机(ID1/ID2)以速度V=2400步/秒，加速度A=50(50*100步/秒^2)，运行至各自的Position位置
+  sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+
+  // 电压检测
+  adc_calibration_init();
+  adc1_config_width(width);
+  adc1_config_channel_atten(channel, atten);
+  esp_adc_cal_characterize(unit, atten, width, 0, &adc_chars);
+
+  // 电量显示LED
+  pinMode(LED_BAT, OUTPUT);
+
+  // 编码器设置
+  I2Cone.begin(19, 18, 400000UL);
+  I2Ctwo.begin(23, 5, 400000UL);
+  sensor1.init(&I2Cone);
+  sensor2.init(&I2Ctwo);
+
+  // mpu6050设置
+  mpu6050.begin();
+  mpu6050.calcGyroOffsets(true);
+
+  // 连接motor对象与编码器对象
+  motor1.linkSensor(&sensor1);
+  motor2.linkSensor(&sensor2);
+
+  // 速度环PID参数
+  motor1.PID_velocity.P = 0.05;
+  motor1.PID_velocity.I = 1;
+  motor1.PID_velocity.D = 0;
+
+  motor2.PID_velocity.P = 0.05;
+  motor2.PID_velocity.I = 1;
+  motor2.PID_velocity.D = 0;
+
+  // 驱动器设置
+  motor1.voltage_sensor_align = 6;
+  motor2.voltage_sensor_align = 6;
+  driver1.voltage_power_supply = 8;
+  driver2.voltage_power_supply = 8;
+  driver1.init();
+  driver2.init();
+
+  // 连接motor对象与驱动器对象
+  motor1.linkDriver(&driver1);
+  motor2.linkDriver(&driver2);
+
+  motor1.torque_controller = TorqueControlType::voltage; // 扭矩控制器类型为 "电压模式"
+  motor2.torque_controller = TorqueControlType::voltage;
+  motor1.controller = MotionControlType::torque; // 运动控制器类型为 "扭矩模式"
+  motor2.controller = MotionControlType::torque;
+    
+  // monitor相关设置
+  motor1.useMonitoring(Serial);
+  motor2.useMonitoring(Serial);
+  
+  // 电机初始化
+  motor1.init();
+  motor1.initFOC();
+  motor2.init();
+  motor2.initFOC();
+
+  // FastLED初始化
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(50); // 设置亮度
+  fill_solid(leds, NUM_LEDS, CRGB::Black); // 初始化为熄灭
+  FastLED.show();
+
+  // Xbox手柄初始化
+  Serial.println("Starting Xbox Bluetooth Client");
+  xboxController.begin();
+
+
+  delay(500);
+}
+
+void loop()
+{
+  
+  // 处理LED闪烁
+  // handleLEDBlink();
+  
+  // 新增：处理警灯效果（非阻塞）
+  updatePoliceLights();
+  
+  // 新增：处理振动效果（非阻塞）
+  updateVibration();
+  
+  // 处理xbox手柄通知
+  process_xbox_notif();
+  
+  bat_check();        // 电压检测
+  delayMicroseconds(1500);
+  mpu6050.update();   // IMU数据更新
+  lqr_balance_loop(); // lqr自平衡控制
+  yaw_loop();         // yaw轴转向控制
+  jump_loop();        // 跳跃动作
+  leg_loop();         // 腿部动作控制
+
+  // 记录上一次的遥控数据数据
+  wrobot.joyx_last = wrobot.joyx;
+  wrobot.joyy_last = wrobot.joyy;
+
+  motor1.target = (-0.5) * (LQR_u + YAW_output); // target正数小车向前，负数向后
+  motor2.target = (-0.5) * (LQR_u - YAW_output);
+
+  loopCounter++;
+  // loopCounter作用：在期初的800次循环内视为电源开通后第一次自平衡，不能进入resetToDefault()函数重置参数
+  // resetToDefaultCounter作用：防止小车倒地后某个角度，陷入循环，motor.target一直=0
+  if ((LQR_angle < -35.0f || LQR_angle > 70.0f ) && loopCounter > 800 && resetToDefaultCounter < 130) {
+    resetZeroPoint();
+    resetToDefaultCounter++;
+    motor1.target = 0;
+    motor2.target = 0;
+  }
+
+  // 大仰角到底，轮子就不要转了 修改
+  if (abs(LQR_angle) > 120.0f) {
+      motor1.target = 0;
+      motor2.target = 0;
+  }
+
+  // 达到平衡角度后，重置重置计数器
+  if( abs(LQR_angle) < 25.0f){
+    resetToDefaultCounter = 0;
+  }
+
+
+  // 小车坐下
+  if (sitting_down) {
+    sitting_down ++;
+
+    if (sitting_down < 15) {
+      // 如果遥感向后运动，给个向后退脉冲，让小车向前倒地
+      if(wrobot.joyy < 0){
+        motor1.target = -1.0;  // 负数小车向后，正数向前
+        motor2.target = -1.0;
+        Position[0] = SERVO0_MIN; // 修改
+        Position[1] = SERVO1_MIN;
+      } else { // 否则默认向前倒地 给个向前脉冲
+        motor1.target = 1.0;  // 负数小车向后，正数向前
+        motor2.target = 1.0;
+        Position[0] = SERVO0_MIN + 60; // 修改
+        Position[1] = SERVO1_MIN - 60;
+        
+      }
+    }else{
+
+      // 通过简单的开环控制前后左右
+      float speed_coeff = 0.02; // 速度系数：值越大，移动越快（建议0.01~0.02）
+      motor1.target = (-0.5) * (wrobot.joyy +  wrobot.joyx) * speed_coeff; 
+      motor2.target = (-0.5) * (wrobot.joyy -  wrobot.joyx) * speed_coeff;
+
+    }
+
+    // 收缩双腿，舵机到最低位置
+    if (sitting_down == 5) {
+      ACC[0] = ACC[1] = 100;
+      Speed[0] = Speed[1] = 200;
+      sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+    }
+   
+  }
+  
+  // 迭代计算FOC相电压
+  motor1.loopFOC();
+  motor2.loopFOC();
+
+  // 设置轮部电机输出
+  motor1.move();
+  motor2.move();
+
+} // loop()
+
+// lqr自平衡控制
+void lqr_balance_loop()
+{
+  /*
+  motor.target 负数小车向后，正数小车向前
+  LQR_u 越大，电机输出的转矩越大，电机向后转，默认0-8V
+  LQR_u = angle_control + gyro_control + distance_control + speed_control
+          = 俯仰角度控制 + 俯仰角速度控制 + 距离控制 + 速度控制
+
+    angle_control = pid_angle(  LQR_angle       -   angle_zeropoint) // 实际pitch角度-目标pitch角度
+                                LQR_angle = mpu6050.getAngleY() 
+    
+    gyro_control = pid_gyro(  LQR_gyro - 0   ) // 实际角速度，目标值是零
+                              LQR_gyro =  mpu6050.getGyroY()
+    
+    distance_control = pid_distance(  LQR_distance - distance_zeropoint) // 两个电机平均旋转弧度（实际位移量） - 位移基准零点（某一时刻LQR_distance快照）
+                                      LQR_distance = (-0.5)*(motor1.shaft_angle + motor2.shaft_angle)  
+
+    speed_control = pid_speed(LQR_speed - speed_target_coeff * lpf_joyy(wrobot.joyy)) // 两个电机平均速度（实际速度） - 摇杆前后输入值* 系数 ，就速度差
+                              LQR_speed = (-0.5) * (motor1.shaft_velocity + motor2.shaft_velocity) 
+                              speed_target_coeff = 前进后退系数
+  yaw 偏航角控制
+  float yaw_angle_control = pid_yaw_angle(yaw_target); 
+                                          yaw_target = wrobot.joyx * 0.1; // 使用摇杆左右转向值
+
+  float yaw_gyro_control = pid_yaw_gyro(YAW_gyro); // yaw 轴的角速度控制
+                                        YAW_gyro =  (float)mpu6050.getGyroZ();
+  
+  YAW_output = yaw_angle_control + yaw_gyro_control;
+
+  motor1.target = (-0.5) * (LQR_u + YAW_output); // target正数小车向前，负数向后
+  motor2.target = (-0.5) * (LQR_u - YAW_output);
+
+   */
+
+  LQR_distance = (-0.5) * (motor1.shaft_angle + motor2.shaft_angle); // 两个电机的旋转角度（shaft_angle）,单位：弧度（rad）实际位移量
+  LQR_speed = (-0.5) * (motor1.shaft_velocity + motor2.shaft_velocity); // 两个电机角速度（shaft_velocity）,单位：弧度 / 秒（rad/s）
+  LQR_angle = (float)mpu6050.getAngleY(); // mpu6050 pitch 角度，单位：度（°）
+  LQR_gyro = (float)mpu6050.getGyroY(); // pitch Y轴角速度,单位：度 / 秒（°/s）
+
+  angle_control = pid_angle(LQR_angle - angle_zeropoint); 
+  gyro_control = pid_gyro(LQR_gyro);
+
+  // 前进后退跳跃的系数都不一样
+  float speed_target_coeff = 0.1; 
+  if( jump_flag ){ // 跳跃
+    speed_target_coeff = 0.1;
+  }else if(wrobot.joyy > 0 ){ // 前进
+    speed_target_coeff = 0.18;
+  }else if(wrobot.joyy < 0){ // 后退 
+    speed_target_coeff = 0.11;
+  }else{
+    speed_target_coeff = 0.1;
+  }
+ 
+  speed_control = pid_speed(LQR_speed - speed_target_coeff * lpf_joyy(wrobot.joyy));  // 最大8v
+
+  // 检测轮子差速，判断轮子是否离地
+  unsigned long current_time = millis();
+  if (current_time - last_speed_record_time >= SPEED_RECORD_INTERVAL) {
+    robot_speed_diff = LQR_speed - last_lqr_speed;
+
+    if(robot_speed_diff > 18.0) // 轮子离地
+    {
+      wheel_ground_flag = 0; // 轮子离地标记
+       // Serial.print("TAKE OFF");
+      // Serial.print(wheel_ground_flag);
+      // Serial.print(",robot_speed_diff:");
+      // Serial.print(robot_speed_diff);
+      // Serial.print(",jump_flag:");
+      // Serial.println(jump_flag); // 100 左右
+    }
+    if( robot_speed_diff < -9.0) // 轮子着地
+    {
+      wheel_ground_flag = 1; // 轮子着地标记
+      // Serial.print("LANDING:");
+      // Serial.print(",robot_speed_diff:");
+      // Serial.print(robot_speed_diff);
+      // Serial.print(",jump_flag:");
+      // Serial.println(jump_flag); // 120左右
+
+      if( jump_flag ){ // 落地点作为新的位移零点
+         resetZeroPoint(); 
+      }
+    }
+    last_lqr_speed = LQR_speed;  // 每隔100ms更新一次历史转速
+    last_speed_record_time = current_time;  // 更新记录时间
+  }
+   
+  // 重置位移零点和积分情形
+  // 1.判断摇杆是否没有前后左右运动指令
+  if ((wrobot.joyx_last != 0 && wrobot.joyx == 0) || (wrobot.joyy_last != 0 && wrobot.joyy == 0)) 
+  {
+    resetZeroPoint(); 
+  }
+  
+  // 2. 运动中实时重置位移零点和积分情形
+  if (abs(robot_speed_diff) > 10 || (abs(LQR_speed) > 15) // 这两种是启动后自平衡，速度较快
+     || wrobot.joyy != 0 || sitting_down ) 
+  {
+       resetZeroPoint(); 
+  }
+
+  distance_control = pid_distance(LQR_distance - distance_zeropoint);
+
+  // 计算 LQR_u
+  // 必须是在跳跃时jump_flag > 0，LQR_u= 角度控制量 + 角速度控制量
+  if ((jump_flag > 0 and jump_flag < 120)) // jump_flag：100离地 120着地
+  {        
+    LQR_u = angle_control + gyro_control;  // 角度控制量 + 角速度控制，位移和速度控制分量被忽略
+  }
+  else // 当轮部未离地时，LQR_u：4个参数
+  {
+    // 当轮部未离地时，LQR_u =角度控制量+角速度控制量+位移控制量+速度控制量
+    LQR_u = angle_control + gyro_control + distance_control + speed_control;
+  }
+
+  // 小车没有控制的时候自稳定状态
+  // 控制量lqr_u<5V，前进后退控制量很小， 遥控器无信号输入joyy=0，轮部位移控制正常介入distance_control<4，不处于跳跃后的恢复时期jump_flag=0,以及不是坐下状态
+  if (abs(LQR_u) < 5 && wrobot.joyy == 0 && abs(distance_control) < 4 && (jump_flag == 0)) //  && !sitting_down
+  {
+    LQR_u = pid_lqr_u(LQR_u); // 小转矩非线性补偿
+    angle_zeropoint -= pid_zeropoint(lpf_zeropoint(distance_control)); // 重心自适应
+  }
+  else
+  {
+    pid_lqr_u.error_prev = 0; // 输出积分清零
+  }
+
+  // 平衡控制参数自适应
+  if (wrobot.height < 50){
+    pid_speed.P = 0.7;
+  }else if (wrobot.height < 64){
+    pid_speed.P = 0.6;
+  }else{
+    pid_speed.P = 0.5;
+  }
+}
+
+// 腿部动作控制（舵机）
+void leg_loop()
+{
+  // 如果坐下就不控制腿部
+  if(sitting_down || jump_flag || jump_pre_flag ){
+    return; // 跳过后续leg高度计算
+  }
+
+  // 机身大角度，譬如倒地时，强制腿部收缩
+  if (abs(LQR_angle) > 25.0f) 
+  {
+    ACC[0] = ACC[1] = 100;
+    Speed[0] = Speed[1] = 400;
+    Position[0] = SERVO0_MIN;
+    Position[1] = SERVO1_MIN;
+    sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+    return; // 跳过后续leg高度计算
+  }
+
+  ACC[0] = ACC[1] = 100; // max 230
+  Speed[0] = Speed[1] = 400;
+
+  float roll_angle = (float)mpu6050.getAngleX() + roll_adjust; // 加上roll角度偏差
+  leg_position_add = pid_roll_angle(lpf_roll(roll_angle));
+
+  // 左后腿默认等于 wrobot.height
+  left_height = wrobot.height;
+  right_height = wrobot.height;
+  LegHeightDiff = 0; // 初始化 roll 角度补偿值
+
+  // 智能计算左右脚高度差， 如果同时有转向和前后指令 ，自动计算腿部高度补偿
+  if(wrobot.mode == 0){
+    if (abs(wrobot.joyx) > 10 && abs(wrobot.joyy) > 10) 
+    {
+      LegHeightDiff = map(abs(wrobot.joyy), 0, 100, 0, 10); 
+      leg_position_add = 0; // 不需要两个脚一样高
+    }
+    if (wrobot.joyx > 10  && abs(wrobot.joyy) > 10) 
+    {
+      // 左脚抬高
+      left_height = wrobot.height + LegHeightDiff ;
+      // Serial.print("左脚抬高");
+    } 
+    else if (wrobot.joyx < -10  && abs(wrobot.joyy) > 10) 
+    {
+      // 右脚抬高
+      right_height = wrobot.height + LegHeightDiff;
+      // Serial.print("右脚抬高");
+    } 
+  }
+  
+  // 根据新的高度计算舵机位置
+  // id[0] 正面看右手，id[1] 正面看左手
+  // 2047是舵机中间位置，8.4是系数，32是默认高度，最高80，最低32
+  // const int LEG_HEIGHT_BASE   这值越小，机身越高，实测范围 0（最高），52（最低）
+  Position[0] = 2047  + 8.4 * (left_height - leg_height_base ) - leg_position_add;
+  Position[1] = 2047  - 8.4 * (right_height - leg_height_base ) - leg_position_add;
+
+  // Serial.print("roll_angle:");
+  // Serial.print(roll_angle);
+  // Serial.print(",Position[0]:");
+  // Serial.print(Position[0]);
+  // Serial.print(",Position[1]:");
+  // Serial.println(Position[1]);
+
+  // 限制舵机位置范围
+  if (Position[0] < SERVO0_MIN) // 舵机1最低
+    Position[0] = SERVO0_MIN;
+  else if (Position[0] > SERVO0_MAX) // 舵机1最高
+    Position[0] = SERVO0_MAX;
+
+  if (Position[1] > SERVO1_MIN) // 舵机2最低（和舵机1方向是反的）
+    Position[1] = SERVO1_MIN;
+  else if (Position[1] < SERVO1_MAX) // 舵机2最高
+    Position[1] = SERVO1_MAX;
+  
+  sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+
+}
+
+// 收缩小腿蓄能
+void jump_charge() // 腿部弯曲（蓄能）
+{
+    ACC[0] = 250;
+    ACC[1] = 250;
+    Speed[0] = 400;
+    Speed[1] = 400;
+    Position[0] = (SERVO0_MIN  + 80); // 不能是SERVO1_MIN值，防止腿部碰撞
+    Position[1] = (SERVO1_MIN  - 80); 
+    sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+}
+
+// 跳跃控制
+void jump_loop()
+{ 
+  if ((wrobot.jump == 1) && (jump_pre_flag == 0))
+  {
+    jump_charge();
+    jump_pre_flag =  1;
+  }
+
+  if(jump_pre_flag > 0 ){
+    jump_pre_flag ++;
+  }
+  
+  if(jump_pre_flag){ 
+    if(!sms_sts.ReadMove(ID[0]) && !sms_sts.ReadMove(ID[1])){
+      jump_flag = 1;
+      jump_pre_flag = 0;
+
+      // 跳跃开始
+      ACC[0] = 0;
+      ACC[1] = 0;
+      Speed[0] = 0;
+      Speed[1] = 0;
+      Position[0] = SERVO0_MAX + 20; // 极限距离
+      Position[1] = SERVO1_MAX - 20;
+      sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+    }
+  }
+
+  if (jump_flag > 0) // 跳跃计数;
+  {
+    jump_flag ++;
+  }
+
+   // 跳跃中，腿部缩起来
+  if( (jump_flag > 30) && (jump_flag < 35) )
+  {
+    ACC[0] = 0;
+    ACC[1] = 0;
+    Speed[0] = 0;
+    Speed[1] = 0;
+    Position[0] = (SERVO0_MIN  + 100); // 100 约等于食指宽度
+    Position[1] = (SERVO1_MIN  - 100); 
+    sms_sts.SyncWritePosEx(ID, 2, Position, Speed, ACC);
+  }
+
+  // 轮子着地
+  if (jump_flag > 200) //  2000=6s ,1s=2000/6=333.33
+  {
+    jump_flag = 0; // 跳跃过程结束
+  }
+
+}
+
+// yaw轴转向控制 （转向控制）
+void yaw_loop()
+{
+  // 跳跃中，YAW_output 设为0，避免干扰左右旋转
+  if(jump_flag) 
+  {
+    YAW_output = 0;
+    return;
+  }
+
+ // 1. 根据abs(wrobot.joyx)，动态设置yaw_target系数
+  float coeff = map( abs(wrobot.joyx), 0, 100, 10, 100) / 100.0f; 
+  coeff = constrain(coeff, 0.1f, 1.0f); 
+  float yaw_target = wrobot.joyx * coeff; 
+
+  // 2. 根据abs(wrobot.joyx)，提高PID响应：临时放大yaw_angle_control（核心突破上限）
+  float yaw_angle_control_coeff = 1.0f;
+  if( wrobot.joyy == 0 && abs(wrobot.joyx) > 10){ // 原地打转
+    yaw_angle_control_coeff = map( abs(wrobot.joyx), 0, 100, 1.0, 2.0); 
+    // 根据转向速度，智能计算wrobot.height 
+    // abs(wrobot.joyx) 范围0到100，默认0，输出范围20-50,默认 30
+    // 反向映射：绝对值30→60，绝对值100→0（线性过渡）
+    wrobot.height = map(abs(wrobot.joyx), 0, 100, 50, 30);
+    // 强制约束输出在0~60范围内（防止异常值）
+    wrobot.height = constrain(wrobot.height, 30, 50);
+    // 使用低波过滤器，平滑数据
+    wrobot.height = lpf_height(wrobot.height);
+
+    // 增加rgb效果
+    if(abs(wrobot.joyx) > 60){
+      handleLEDBlink();
+    }
+  }
+
+  float yaw_angle_control = pid_yaw_angle(yaw_target) * yaw_angle_control_coeff; 
+  // 限制yaw_angle_control上限，避免超压（按电机7.4V反推，设为12较合适）
+  yaw_angle_control = constrain(yaw_angle_control, -12.0f, 12.0f);
+
+  YAW_gyro = (float)mpu6050.getGyroZ(); // 左右偏航角速度，用于纠正小车前后走直线时的角度偏差 
+  float yaw_gyro_control = pid_yaw_gyro(YAW_gyro);
+  YAW_output = yaw_angle_control + yaw_gyro_control;
+}
+
+// 电压检测初始化
+void adc_calibration_init()
+{
+  if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK)  {
+    printf("eFuse Two Point: Supported\n");
+  }  else  {
+    printf("eFuse Two Point: NOT supported\n");
+  }
+  // Check Vref is burned into eFuse
+  if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_VREF) == ESP_OK)  {
+    printf("eFuse Vref: Supported\n");
+  }  else  {
+    printf("eFuse Vref: NOT supported\n");
+  }
+}
+
+// 电压检测
+void bat_check()
+{
+  if (bat_check_num > 1000)
+  {
+    // 电压读取
+    uint32_t sum = 0;
+    sum = analogRead(BAT_PIN);
+    uint32_t voltage = esp_adc_cal_raw_to_voltage(sum, &adc_chars);
+    double battery = (voltage * 3.97) / 1000.0;
+
+    // Serial.println(battery);
+    // 电量显示
+    if (battery >= 7.8)
+      digitalWrite(LED_BAT, HIGH);
+    else
+      digitalWrite(LED_BAT, LOW);
+    bat_check_num = 0;
+  }
+  else
+    bat_check_num++;
+}
+
+// 重置距离零点
+void resetZeroPoint() {
+  distance_zeropoint =  LQR_distance;
+  pid_lqr_u.error_prev = 0;
+}
+
+// 添加LED闪烁处理函数
+void handleLEDBlink() {
+  if (!isBlinking) return;
+  
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - previousBlinkMillis >= 100) { // 每100ms切换一次状态，实现快速闪烁
+    previousBlinkMillis = currentMillis;
+    
+    if (blinkState == 0) {
+      // LED亮
+      fill_solid(leds, NUM_LEDS, blinkColors[blinkCount]);
+      FastLED.show();
+      blinkState = 1;
+    } else {
+      // LED灭
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      blinkState = 0;
+      blinkCount++;
+      
+      // 检查是否完成6次闪烁
+      if (blinkCount >= 6) {
+        isBlinking = false;
+        blinkCount = 0;
+        // 闪烁完成后保持熄灭状态
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+      }
+    }
+    
+    FastLED.show();
+  }
+}
+
+// 振动控制函数实现
+
+// 开始振动 - 基础振动功能
+void startVibration(uint8_t leftPower, uint8_t rightPower, uint8_t duration) {
+  if (!xboxController.isConnected()) {
+    Serial.println("Xbox controller not connected, cannot vibrate");
+    return;
+  }
+  
+  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase vibrationReport;
+  vibrationReport.setAllOff();  // 先清空所有设置
+  
+  // 设置振动参数
+  vibrationReport.v.select.left = (leftPower > 0);
+  vibrationReport.v.select.right = (rightPower > 0);
+  vibrationReport.v.power.left = min(leftPower, (uint8_t)100);    // 限制在0-100范围
+  vibrationReport.v.power.right = min(rightPower, (uint8_t)100);  // 限制在0-100范围
+  vibrationReport.v.timeActive = duration;               // 持续时间（单位：0.01秒）
+  vibrationReport.v.timeSilent = 0;                      // 静默时间
+  vibrationReport.v.countRepeat = 0;                     // 重复次数
+  
+  // 发送振动指令
+  xboxController.writeHIDReport(vibrationReport);
+  
+  // 更新状态
+  vibrationActive = true;
+  vibrationStartTime = millis();
+  vibrationDuration = duration;
+  
+  Serial.printf("Vibration started: L=%d, R=%d, Duration=%d\n", leftPower, rightPower, duration);
+}
+
+// 停止振动
+void stopVibration() {
+  if (!xboxController.isConnected()) {
+    return;
+  }
+  
+  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase stopReport;
+  stopReport.setAllOff();  // 关闭所有振动
+  
+  xboxController.writeHIDReport(stopReport);
+  
+  // 重置状态
+  vibrationActive = false;
+  pulseCount = 0;
+  pulseState = false;
+  
+  Serial.println("Vibration stopped");
+}
+
+// 脉冲振动 - 适合跳跃等动作反馈
+void pulseVibration(uint8_t power, uint8_t pulses, uint8_t pulseDuration) {
+  if (!xboxController.isConnected()) {
+    Serial.println("Xbox controller not connected, cannot vibrate");
+    return;
+  }
+  
+  // 设置脉冲参数
+  pulseCount = pulses;
+  pulseDuration = pulseDuration;
+  lastPulseTime = millis();
+  pulseState = true;
+  
+  // 开始第一个脉冲
+  startVibration(power, power, pulseDuration);
+  
+  Serial.printf("Pulse vibration started: Power=%d, Pulses=%d, Duration=%d\n", power, pulses, pulseDuration);
+}
+
+// 更新振动状态 - 需要在loop()中调用
+void updateVibration() {
+  if (!vibrationActive && pulseCount == 0) {
+    return;  // 没有活动的振动
+  }
+  
+  unsigned long now = millis();
+  
+  // 处理脉冲振动
+  if (pulseCount > 0) {
+    if (pulseState && (now - lastPulseTime >= pulseDuration * 10)) {
+      // 当前脉冲结束，进入间隔
+      stopVibration();
+      pulseState = false;
+      lastPulseTime = now;
+    } else if (!pulseState && (now - lastPulseTime >= 100)) {  // 100ms间隔
+      // 间隔结束，开始下一个脉冲
+      pulseCount--;
+      if (pulseCount > 0) {
+        pulseState = true;
+        lastPulseTime = now;
+        // 重新开始振动（使用相同的功率）
+        startVibration(50, 50, pulseDuration);  // 默认功率50
+      }
+    }
+  }
+  
+  // 处理普通振动超时
+  if (vibrationActive && (now - vibrationStartTime >= vibrationDuration * 10)) {
+    stopVibration();
+  }
+}
+
+/*========================================
+ * 控制器数据处理（共用函数）
+ * ========================================*/
+void processControllerData(const XboxControllerNotificationParser& remoteData) {
+
+/*
+String str = String(xboxController.xboxNotif.btnY) + "," + // Y键
+            String(xboxController.xboxNotif.btnX) + "," + // X键
+            String(xboxController.xboxNotif.btnB) + "," + // B键
+            String(xboxController.xboxNotif.btnA) + "," + // A键
+            String(xboxController.xboxNotif.btnLB) + "," + // 左肩键
+            String(xboxController.xboxNotif.btnRB) + "," + // 右肩键
+            String(xboxController.xboxNotif.btnSelect) + "," + // 中间十字 左键 试图键
+            String(xboxController.xboxNotif.btnStart) + "," + // 中间十字 右键 菜单键
+            String(xboxController.xboxNotif.btnXbox) + "," + // 中间十字 上键 home键
+            String(xboxController.xboxNotif.btnShare) + "," + // 中间十字 下键 截图键
+            String(xboxController.xboxNotif.btnLS) + "," + // 左摇杆键
+            String(xboxController.xboxNotif.btnRS) + "," + // 右摇杆键
+            String(xboxController.xboxNotif.btnDirUp) + "," + // 上键
+            String(xboxController.xboxNotif.btnDirRight) + "," + // 右键
+            String(xboxController.xboxNotif.btnDirDown) + "," + // 下键
+            String(xboxController.xboxNotif.btnDirLeft) + "," + // 左键
+            String(xboxController.xboxNotif.joyLHori) + "," + // 左摇杆 水平轴 （左-右 0 -65535）
+            String(xboxController.xboxNotif.joyLVert) + "," + // 左摇杆 垂直轴 （上-下 0 -65535）
+            String(xboxController.xboxNotif.joyRHori) + "," + // 右摇杆 水平轴 （左-右 0 -65535）
+            String(xboxController.xboxNotif.joyRVert) + "," + // 右摇杆 垂直轴 （上-下 0 -65535）
+            String(xboxController.xboxNotif.trigLT) + "," + // 左扳机键 （松开- 按下 0 -1023）
+            String(xboxController.xboxNotif.trigRT) ; // 右扳机键 （松开- 按下 0 -1023）
+  Serial.println(str);
+  */
+
+  // rgb led 上键 闪烁6次：红红黄黄绿绿
+  if(remoteData.btnDirUp && !isBlinking){
+    isBlinking = true;
+    blinkCount = 0;
+    blinkState = 0;
+    previousBlinkMillis = millis();
+  }
+
+  // 坐下 back键
+  if (remoteData.btnLB && robot_enabled) { 
+    robot_enabled = false;
+    sitting_down = 1; // 标记开始坐下动作保存当前的角度零点
+  }
+  // 起立 start键
+  if (remoteData.btnRB && !robot_enabled) {
+    robot_enabled = true;
+    sitting_down = 0; // 清除坐下动作标记
+  }
+
+  // 修改后代码（保留摇杆指令，仅禁止起升/跳跃）
+  if (!robot_enabled || sitting_down) {
+    wrobot.jump = 0; // 禁止跳跃
+    wrobot.roll = 0; // 禁止左右摇摆（起升相关）
+    wrobot.height = 0; // 禁止高度调整（起升相关）
+  }
+
+  // 跳跃状态不接受指令
+  if( jump_flag > 0){
+    wrobot.jump = 0; // 强制设为“不跳跃”
+    wrobot.joyx = 0; // 清空左右转向指令
+    wrobot.joyy = 0; // 清空前后移动指令
+    wrobot.roll = 0; // 清空左右摇摆指令
+    return;
+  }
+
+    // 前后移动 右摇杆Y轴
+    int convertedJ2PotY = constrain(
+      map(remoteData.joyRVert, 0, 65535, 100, -100),  // 原始0~65535，目标100~-100
+      -100, 100
+    );
+    if(abs(convertedJ2PotY) > deadZone) {    // 前后运动 -100 到 100
+      wrobot.joyy = convertedJ2PotY;
+    }else{
+      wrobot.joyy = 0;
+    } 
+
+
+  if(wrobot.mode == 0) // 智能模式
+  {
+
+    // 左右转向 左摇杆X轴：先映射到-100~100，再按比例放大到-100~100
+    int convertedJ1PotX = constrain(
+      map(remoteData.joyLHori, 0, 65535, -100, 100),  
+      -100, 100
+    );
+    if(abs(convertedJ1PotX) > deadZone) { // 左右运动  -100 到 100
+      wrobot.joyx = convertedJ1PotX; 
+    } else {
+      wrobot.joyx = 0;
+    }
+
+    // 智能计算wrobot.height ，根据前后速度，
+    // convertedJ2PotY 范围-100到100，默认0，输出范围30（最矮）-50（最高）, 默认 50
+    wrobot.height = map( abs(convertedJ2PotY), 0, 100, 50, 30);
+    wrobot.height = constrain(wrobot.height, 30, 50);
+    wrobot.height = lpf_height(wrobot.height);
+
+  }
+  else if(wrobot.mode == 1) // 手动模式
+  {
+    // 摇摆角度 左摇杆X轴，先映射到-60~60，再按比例放大到-100~100
+    int convertedJ1PotX = constrain(
+      map(remoteData.joyLHori, 0, 65535, -30, 30) * (100.0/30),   // 先映射到-30~30，再按比例放大到-100~100
+      -100, 100
+    );
+    if(abs(convertedJ1PotX) >  (deadZone * 2)  ) { // 防止同一个摇杆上下左右移动相互干扰
+      roll_adjust = convertedJ1PotX;
+    }else{
+      roll_adjust = 0;
+    }
+
+    // 上下高度 左摇杆Y轴：原始0-65535 → 目标MAX到MIN
+    int convertedJ1PotY = constrain(
+        map(remoteData.joyLVert, 0, 65535, 100, -100), // 原始范围0-65535，目标范围100到-100，默认中间0
+        -100, 100
+      );
+    if(abs(convertedJ1PotY) < (deadZone * 2) ) { 
+      convertedJ1PotY = 0;
+    }
+    wrobot.height = map( convertedJ1PotY, -100, 100, 30, 70);
+    wrobot.height = constrain(wrobot.height, 30, 70);
+    wrobot.height = lpf_height(wrobot.height);
+
+    // 左右转向 右摇杆X轴：原始0-960 → 目标-100到100 
+    int convertedJ2PotX = constrain(
+      map(remoteData.joyRHori, 0, 65535, -100, 100),  // 原始范围0-65535，目标范围-100到100，默认中间0
+      -100, 100
+    );
+    if(abs(convertedJ2PotX) >  ( deadZone * 2)) {
+      wrobot.joyx  = convertedJ2PotX;
+    }else{
+      wrobot.joyx = 0;
+    }
+  }
+
+  // 跳跃 右摇杆按键
+  if (remoteData.btnRS && !last_btnbtnRS) { // 1=true，0=false
+    wrobot.jump = 1; // 跳跃
+    // 跳跃时触发振动反馈
+    pulseVibration(80, 2, 15); // 80%强度，2次脉冲，每次150ms
+    Serial.println("Jump triggered with vibration feedback!");
+  }else{
+    wrobot.jump = 0; // 不跳跃
+  }
+  last_btnbtnRS = remoteData.btnRS; 
+
+  // 切换智能模式和手动模式
+  if (remoteData.btnY && !last_btnY) {  // 1:左摇杆上下摇摆控制（手动）
+      wrobot.mode = 1; 
+      startVibration(50, 50, 15);  // 手动模式：中等强度，150ms
+      Serial.println("切换到手动模式");
+  }
+  if (remoteData.btnA && !last_btnA) {  // 0:左摇杆左右转向控制（智能）
+      wrobot.mode = 0; 
+      roll_adjust = 0.0f; 
+      leg_height_base = 20.0f;
+      pulseVibration(50, 2, 10);   // 智能模式：中等强度，2次脉冲，每次100ms
+      Serial.println("切换到智能模式");
+  }
+  last_btnY = remoteData.btnY;  // 更新Y键状态记录
+  last_btnA = remoteData.btnA;  // 更新A键状态记录
+
+  // 新增：警灯开关控制 - X键
+  if (remoteData.btnX && !last_btnX) {  // 检测X键按下边沿（防止长按重复触发）
+    policeLightsEnabled = !policeLightsEnabled;  // 切换警灯开关状态
+    Serial.print("警灯状态切换为: ");
+    Serial.println(policeLightsEnabled ? "开启" : "关闭");
+    
+    // 警灯开关振动反馈
+    if (policeLightsEnabled) {
+      startVibration(60, 60, 20);  // 开启：中等强度，200ms
+    } else {
+      pulseVibration(40, 3, 8);    // 关闭：轻微强度，3次脉冲，每次80ms
+    }
+  }
+  last_btnX = remoteData.btnX;  // 更新按键状态记录
+}
+
+/* Xbox数据处理函数（直接传递原生数据） */
+void process_xbox_notif(){
+  xboxController.onLoop();
+  if (xboxController.isConnected()){
+    if (xboxController.isWaitingForFirstNotification()){
+      Serial.println("Waiting for first Xbox data...");
+    }else{
+      // Serial.println("Xbox controller connected !!!"); // 手柄蓝灯常亮
+      processControllerData(xboxController.xboxNotif);
+    }
+  }
+  else{
+    Serial.println("Xbox controller not connected");
+  }
+}
+
+// 新增：启动警灯效果（参数：闪烁速度ms，重复次数）
+void startPoliceLights(int speed, int repeats) {
+  currentSpeed = speed;
+  remainingRepeats = repeats * 2;  // 每个重复需要两次状态切换（红-蓝+蓝-红）
+  currentLedState = 0;
+  lastLedUpdate = millis();
+  isPoliceLightsActive = true;
+}
+
+// 新增：非阻塞警灯更新函数（需在loop中调用）
+void updatePoliceLights() {
+  // 检查警灯总开关状态
+  if (!policeLightsEnabled) {
+    // 如果警灯被关闭，熄灭所有LED并重置状态
+    if (isPoliceLightsActive) {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      isPoliceLightsActive = false;
+    }
+    return;
+  }
+  
+  if (!isPoliceLightsActive) {
+    // 模式切换逻辑（模拟原示例的循环效果）
+    unsigned long now = millis();
+    if (now - lastModeChange >= (policeMode == 0 ? 300 : 500)) {
+      switch (policeMode) {
+        case 0: startPoliceLights(150, 5); break;  // 慢速模式
+        case 1: startPoliceLights(50, 10); break;   // 快速模式
+        case 2: startPoliceLights(30, 15); break;   // 超快速模式
+      }
+      policeMode = (policeMode + 1) % 3;
+      lastModeChange = now;
+    }
+    return;
+  }
+  
+  // 状态更新逻辑（根据时间戳切换）
+  unsigned long now = millis();
+  if (now - lastLedUpdate >= currentSpeed) {
+    lastLedUpdate = now;
+    
+    // 切换颜色组合
+    if (currentLedState == 0) {
+      leds[0] = CRGB(255, 0, 0);  // 红
+      leds[1] = CRGB(0, 0, 255);  // 蓝
+    } else {
+      leds[0] = CRGB(0, 0, 255);  // 蓝
+      leds[1] = CRGB(255, 0, 0);  // 红
+    }
+    FastLED.show();  // 更新LED显示
+    
+    // 减少剩余次数，完成时关闭当前模式
+    if (--remainingRepeats <= 0) {
+      isPoliceLightsActive = false;
+      lastModeChange = millis();
+    }
+    currentLedState = !currentLedState;
+  }
+}
+

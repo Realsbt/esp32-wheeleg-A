@@ -189,6 +189,29 @@ void Ctrl_StandupPrepareTask(void *arg)
 	vTaskDelete(NULL);
 }
 
+// 温和起立任务：不劈叉，只通过目标值让PID/LQR平滑调整腿部
+void Ctrl_GentleStandupTask(void *arg)
+{
+    const float wheelRadius = 0.0325f;
+
+    // 不设置 StandupState_Prepare，让 CtrlBasic_Task 的平衡控制继续运行
+    // 只是温和地设置目标值
+    target.legLength = 0.07f;
+    target.rollAngle = 0.0f;
+    target.speedCmd = 0.0f;
+    target.yawSpeedCmd = 0.0f;
+
+    // 等待腿部平稳调整
+    vTaskDelay(800 / portTICK_PERIOD_MS);
+
+    // 重置位置和yaw目标为当前实际值
+    target.position = (leftWheel.angle + rightWheel.angle) / 2 * wheelRadius;
+    target.yawAngle = imuData.yaw;
+    target.speed = 0.0f;
+
+    Serial.println("Gentle standup completed");
+    vTaskDelete(NULL);
+}
 
 //没有起立
 void CtrlBasic_Task(void *arg)

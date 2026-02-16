@@ -18,7 +18,7 @@
 
 extern void Ctrl_StandupPrepareTask(void *arg);
 extern void Ctrl_JumpPrepareTask(void *arg);
-extern void Ctrl_GentleStandupTask(void *arg);
+
 
 // Xbox手柄实例 - 使用空MAC地址以启用自动扫描模式（通过设备名称"Xbox Wireless Controller"连接）
 // 如果需要指定MAC地址，可以传入MAC地址字符串，例如: XboxSeriesXControllerESP32_asukiaaa::Core xboxController("57:5B:5D:FE:B3:C3");
@@ -41,7 +41,6 @@ bool crossStepToggled = false;
 static uint32_t lastXToggleMs = 0;  // 记录上次X键切换时间
 static uint32_t lastYToggleMs = 0;  // 记录上次Y键切换时间
 static bool lastLTPressed = false;  // 左扳机上次状态
-static bool lastRTPressed = false;  // 右扳机上次状态
 
 // BLE输入开关：允许禁用对target的覆盖
 static volatile bool sBleInputEnabled = true;
@@ -241,13 +240,8 @@ void processControllerData(const XboxControllerNotificationParser& data)
     }
     lastLTPressed = currentLTPressed;
 
-    // 右扳机(RT)：按深触发温和起立
-    bool currentRTPressed = (data.trigRT > 500);
-    if (currentRTPressed && !lastRTPressed) {
-        xTaskCreate(Ctrl_GentleStandupTask, "GentleStandup_Task", 4096, NULL, 1, NULL);
-        Serial.println("Gentle standup triggered via RT");
-    }
-    lastRTPressed = currentRTPressed;
+    // 右扳机(RT)：按住时进入腿部测试模式（左腿伸长、右腿缩短）
+    legTestMode = (data.trigRT > 500);
 
     // 更新按钮状态
     last_btnA = current_btnA;

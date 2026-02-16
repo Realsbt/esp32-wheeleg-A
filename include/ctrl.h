@@ -42,6 +42,7 @@ extern Target target;
 extern StateVar stateVar;
 extern StandupState standupState;
 extern bool balanceEnabled; // 平衡站立使能标志
+extern bool legTestMode; // 腿部测试模式标志（右扳机按住时生效）
 
 void Ctrl_Init(void);
 void StandUp(void);

@@ -17,6 +17,7 @@ Target target = {0, 0, 0, 0, 0, 0, 0.07f};
 StateVar stateVar;
 StandupState standupState = StandupState_None; // 初始状态为None，不自动站立
 bool balanceEnabled = false; // 平衡站立是否使能，默认关闭（需要按Y键启用）
+bool legTestMode = false; // 腿部测试模式，右扳机按住时生效
 GroundDetector groundDetector = {10, 10, true, false};	//离地检测器 默认状态为触地
 //测试用
 #define SIN_FREQUENCY_MS 5000 // 周期，单位毫秒
@@ -241,12 +242,35 @@ void CtrlBasic_Task(void *arg)
         // 未使能平衡站立：关闭所有电机输出并跳过控制计算
         if (!balanceEnabled)
         {
-            Motor_SetTorque(&leftJoint[0], 0.0f);
-            Motor_SetTorque(&leftJoint[1], 0.0f);
-            Motor_SetTorque(&leftWheel, 0.0f);
-            Motor_SetTorque(&rightJoint[0], 0.0f);
-            Motor_SetTorque(&rightJoint[1], 0.0f);
-            Motor_SetTorque(&rightWheel, 0.0f);
+            if (legTestMode)
+            {
+                // 腿部测试模式：左腿施加向下推力（伸长），右腿施加向上拉力（缩短）
+                float testForce = 3.0f; // N，较温和的力值，可调节
+
+                float leftJointTorque[2] = {0};
+                leg_vmc_conv(testForce, 0, leftJoint[1].angle, leftJoint[0].angle, leftJointTorque);
+                float rightJointTorque[2] = {0};
+                leg_vmc_conv(-testForce, 0, rightJoint[1].angle, rightJoint[0].angle, rightJointTorque);
+
+                Motor_SetTorque(&leftJoint[0], -leftJointTorque[0]);
+                Motor_SetTorque(&leftJoint[1], -leftJointTorque[1]);
+                Motor_SetTorque(&rightJoint[0], -rightJointTorque[0]);
+                Motor_SetTorque(&rightJoint[1], -rightJointTorque[1]);
+
+                // 轮电机保持关闭
+                Motor_SetTorque(&leftWheel, 0.0f);
+                Motor_SetTorque(&rightWheel, 0.0f);
+            }
+            else
+            {
+                // 原有逻辑：所有电机归零
+                Motor_SetTorque(&leftJoint[0], 0.0f);
+                Motor_SetTorque(&leftJoint[1], 0.0f);
+                Motor_SetTorque(&leftWheel, 0.0f);
+                Motor_SetTorque(&rightJoint[0], 0.0f);
+                Motor_SetTorque(&rightJoint[1], 0.0f);
+                Motor_SetTorque(&rightWheel, 0.0f);
+            }
             standupState = StandupState_None;
             target.speedCmd = 0.0f;
             target.yawSpeedCmd = 0.0f;

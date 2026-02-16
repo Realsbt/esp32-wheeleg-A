@@ -2,7 +2,7 @@
  * File: out_lqr_k.h
  *
  * MATLAB Coder version            : 5.3
- * C/C++ source code generated on  : 30-Mar-2024 18:16:14
+ * C/C++ source code generated on  : 10-Feb-2026 18:16:14
  */
 
 #ifndef LQR_K_H

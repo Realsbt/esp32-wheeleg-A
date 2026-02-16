@@ -2,7 +2,7 @@
  * File: out_leg_vmc_conv.h
  *
  * MATLAB Coder version            : 5.3
- * C/C++ source code generated on  : 17-Dec-2023 17:05:38
+ * C/C++ source code generated on  : 05-Feb-2026 17:05:38
  */
 
 #ifndef LEG_VMC_CONV_H

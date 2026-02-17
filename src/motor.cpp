@@ -210,6 +210,7 @@ void Motor_ClearParams(void)
 
 // 处理串口命令
 bool logEnabled = false;
+bool imuLogEnabled = false;
 
 void Motor_HandleSerialCommand(void)
 {
@@ -230,6 +231,12 @@ void Motor_HandleSerialCommand(void)
             } else if(input == "nolog") {
                 logEnabled = false;
                 Serial.println("持续输出关节角度已关闭");
+            } else if(input == "imulog") {
+                imuLogEnabled = true;
+                Serial.println("IMU data output enabled, send 'noimulog' to stop");
+            } else if(input == "noimulog") {
+                imuLogEnabled = false;
+                Serial.println("IMU data output disabled");
             }
             input = "";
         } else {
@@ -244,6 +251,15 @@ void Log_Task(void *arg)
     while(1) {
         if(logEnabled) {
             Serial.printf("%.3f,%.3f,%.3f,%.3f\n", leftJoint[0].angle, leftJoint[1].angle, rightJoint[0].angle, rightJoint[1].angle);
+        }
+        if(imuLogEnabled) {
+            Serial.printf("R:%.2f P:%.2f Y:%.2f | dR:%.2f dP:%.2f dY:%.2f\n",
+                imuData.roll * 180.0f / M_PI,
+                imuData.pitch * 180.0f / M_PI,
+                imuData.yaw * 180.0f / M_PI,
+                imuData.rollSpd * 180.0f / M_PI,
+                imuData.pitchSpd * 180.0f / M_PI,
+                imuData.yawSpd * 180.0f / M_PI);
         }
         vTaskDelay(100); // 100ms输出一次
     }

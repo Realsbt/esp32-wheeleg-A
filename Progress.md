@@ -133,3 +133,17 @@
   3. If motors don't respond or move in wrong direction, indicates motor or CAN issue
   4. Release RT to immediately zero all motors
   5. Use serial `log` command to monitor joint angles in real time
+
+## 2026/2/17 - IMU Serial Debug Output & Roll Diagnosis
+
+- **Problem**: Robot drifts to one side during balancing, suspected Roll axis issue; need to check if IMU is functioning correctly
+- **Solution**: Added `imulog` / `noimulog` serial commands to continuously output IMU data via USB serial
+  - Output format: `R:0.12 P:-0.35 Y:2.10 | dR:0.01 dP:-0.02 dY:0.00` (degrees and deg/s)
+  - Updates every 100ms in `Log_Task`
+- **Diagnosis steps**:
+  1. Connect USB serial at 115200 baud, send `imulog`
+  2. Place robot on level surface, check if Roll and Pitch are near 0 degrees (within +/-2 deg is normal)
+  3. Slowly tilt robot left/right, verify Roll changes smoothly and symmetrically
+  4. Return to level, confirm Roll returns to near 0
+  5. If Roll shows large static offset, send `imu` to recalibrate (keep robot still and level)
+  6. Send `noimulog` to stop output

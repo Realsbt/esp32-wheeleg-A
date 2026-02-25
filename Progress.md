@@ -147,3 +147,34 @@
   4. Return to level, confirm Roll returns to near 0
   5. If Roll shows large static offset, send `imu` to recalibrate (keep robot still and level)
   6. Send `noimulog` to stop output
+
+---
+
+## 2026/2/18 ~ 2/22 - Sensor Research, Mechanical Design & Algorithm Optimization
+
+### ToF LiDAR Integration Research
+- Investigated ToF LiDAR sensor options (TFmini Plus / TF-Luna, etc.) and confirmed UART interface approach
+- Analyzed ESP32 GPIO/UART resource usage; decided to use UART1 (GPIO 25/26) for ToF connection
+- Evaluated host-controller communication options, comparing micro-ROS, direct serial, and WiFi approaches
+- Finalized system architecture: laptop as the host machine (ROS 2 + SLAM), ESP32 retains low-level balance control
+- Adopted a layered architecture:
+  - **Host (Laptop):** connects 360° LiDAR via USB; runs ROS 2 with `slam_toolbox` for mapping and `Nav2` for navigation
+  - **Controller (ESP32):** retains existing balance control system; receives velocity commands from host via serial (UART2)
+
+### OpenMV Research
+- Investigated OpenMV as a lightweight vision module for object detection and tracking
+- Evaluated integration options with the existing ESP32 system via UART or SPI
+
+### Mechanical Design & 3D Printing
+- Designed and 3D-printed a mounting base for attaching the ToF LiDAR sensor to the robot chassis
+- Iterated on the bracket design to ensure stable sensor positioning and minimal vibration interference
+
+### Balance Algorithm Optimization
+- Optimized the LQR portion of the balance control algorithm
+- Tuned LQR gain matrices for improved stability and disturbance rejection
+- Reduced the main balance loop period for faster control response
+- Lowered the yaw outer-loop saturation limit by one level to observe whether high-speed straight-line stability improves significantly
+
+### Interface Design
+- Designed host-to-ESP32 communication protocol (extending the existing serial command system)
+- Planned a real-time velocity command interface on ESP32 (directly updates `target` variables, bypassing the command queue for lower latency)
